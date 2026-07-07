@@ -1,0 +1,35 @@
+#!/bin/bash
+acct=PSN009933
+vtime=`date`
+imei=`cat ../IMEI`
+sim=`cat ../SIMCARD`
+uptime=`sed 's/.*[ ]//' < /proc/uptime`
+dskused=`df -v | awk '{ if (match($1,"rootfs|/dev/mmcblk0p3")) print $6 "=" $5 }' | tr "\r\n" " "`
+id="v-time=$vtime IMEI=$imei SIM=$sim UpTime=$uptime"
+hostid=~/roots/100_PayloadInterface/hostid.txt
+if [ -f "$hostid" ]; then
+  for tag in sn longname imei; do
+    val=`grep -Po $tag='\K[^ ,}]*' "$hostid"`
+    if [ -n "$val" ]; then id="$id V$tag=$val"; fi
+  done
+fi
+
+id="$id Usage $dskused"
+
+#catalouges vrl files to show what files are listed in the 201E folder
+#ls -l /mnt/XDATA/PPPHost/NewFiles/201E/ > vrlcat.txt
+#scp vrlcat.txt PSN009933@smc.wgms.com:~/VRL_Files/2023/
+
+
+
+#original working script from 2022
+rsync -avz /mnt/XDATA/PPPHost/NewFiles/201E/ PSN009933@smc.wgms.com:~/VRL_Files/2025/
+
+#pulls populate_subseastation.bash and runs it on glider, syncs VM4 files to confrim the station list was updated
+#rsync -avz PSN009683@smc.wgms.com:~/VM4_Files/populate_subseastations.bash /home/smc/
+#./populate_subseastations.bash
+#rsync -avz /home/smc/roots/200_VemcoVM4/ PSN009683@smc.wgms.com:~/VM4_Files/
+
+
+exec timelimit2 --timeout=600 ssh -i ../$acct $acct@smc.wgms.com "./response \"$id minimal-runme\""
+

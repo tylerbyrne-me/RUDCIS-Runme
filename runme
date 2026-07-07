@@ -1,0 +1,418 @@
+#!/bin/bash
+# Ruggedized RUDICS runme — VRL offload + incremental Vemco detection export
+set -u
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+acct="PSN009933"
+remote_host="smc.wgms.com"
+remote_user="${acct}"
+ssh_key="../${acct}"
+
+vrl_source="/mnt/XDATA/PPPHost/NewFiles/201E/"
+vrl_staging="/mnt/XDATA/PPPHost/.runme_staging"
+remote_vrl_base="~/VRL_Files"
+
+vemco_log="/home/smc/log/VemcoVM4.log"
+vemco_rotated="/home/smc/log/VemcoVM4.log.1"
+remote_det_base="~/RT_Detections"
+
+state_dir="/home/smc/.runme_state"
+offset_state="${state_dir}/vemco.offset"
+run_log="${state_dir}/runme.log"
+det_backup_dir="${state_dir}/detections"
+
+hostid="${HOME}/roots/100_PayloadInterface/hostid.txt"
+
+rsync_timeout=600
+rsync_retries=3
+ssh_timeout=600
+
+# ---------------------------------------------------------------------------
+# Status / logging helpers
+# ---------------------------------------------------------------------------
+status_parts=()
+error_count=0
+
+log_msg() {
+  local ts
+  ts="$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+  mkdir -p "${state_dir}" 2>/dev/null || true
+  printf '%s %s\n' "${ts}" "$*" >> "${run_log}" 2>/dev/null || true
+}
+
+status_add() {
+  status_parts+=("$1")
+}
+
+status_warn() {
+  status_add "$1"
+  error_count=$((error_count + 1))
+  log_msg "WARN: $1"
+}
+
+status_join() {
+  local joined=""
+  local part
+  for part in "${status_parts[@]}"; do
+    if [ -z "${joined}" ]; then
+      joined="${part}"
+    else
+      joined="${joined} ${part}"
+    fi
+  done
+  printf '%s' "${joined}"
+}
+
+read_file_safe() {
+  local path="$1"
+  if [ -f "${path}" ]; then
+    cat "${path}" 2>/dev/null | tr -d '\r\n'
+  fi
+}
+
+grep_hostid_field() {
+  local field="$1"
+  if [ -f "${hostid}" ]; then
+    grep -Po "${field}='\K[^ ,}]*" "${hostid}" 2>/dev/null || true
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Remote directory + rsync helpers
+# ---------------------------------------------------------------------------
+ssh_remote() {
+  if command -v timelimit2 >/dev/null 2>&1; then
+    timelimit2 --timeout=120 ssh -i "${ssh_key}" "${remote_user}@${remote_host}" "$@"
+  else
+    ssh -i "${ssh_key}" "${remote_user}@${remote_host}" "$@"
+  fi
+}
+
+ensure_remote_dir() {
+  local remote_path="$1"
+  if ssh_remote "mkdir -p ${remote_path}"; then
+    return 0
+  fi
+  log_msg "mkdir -p failed on remote: ${remote_path}"
+  return 1
+}
+
+rsync_with_retry() {
+  local attempt=1
+  local rc=1
+  while [ "${attempt}" -le "${rsync_retries}" ]; do
+    if command -v timelimit2 >/dev/null 2>&1; then
+      timelimit2 --timeout="${rsync_timeout}" rsync -avz --partial --timeout=120 "$@"
+      rc=$?
+    else
+      rsync -avz --partial --timeout=120 "$@"
+      rc=$?
+    fi
+    if [ "${rc}" -eq 0 ]; then
+      return 0
+    fi
+    log_msg "rsync attempt ${attempt}/${rsync_retries} failed (rc=${rc}): $*"
+    attempt=$((attempt + 1))
+    sleep 2
+  done
+  return "${rc}"
+}
+
+# ---------------------------------------------------------------------------
+# Vemco detection awk parser (reads stdin, writes CSV rows to stdout)
+# ---------------------------------------------------------------------------
+parse_vemco_detections() {
+  awk '
+    function emit_pending(    e, la, lo) {
+      if (pending_tag_id == "") return
+      e = pending_epoch; la = pending_lat; lo = pending_lon
+      printf "%s,%s,%s,%s,%s,%s,%s,%s,%s\n",
+        pending_log_time, pending_detect_time, pending_tag_full_id,
+        pending_freq, pending_space, pending_tag_id, e, la, lo
+      pending_tag_id = ""
+      pending_epoch = ""
+      pending_lat = ""
+      pending_lon = ""
+      in_rt_block = 0
+    }
+
+    /VemcoVM4Lib: DETECTION =>/ {
+      emit_pending()
+      pending_log_time = $1 " " $2
+      pending_detect_time = ""
+      pending_tag_full_id = ""
+      pending_freq = ""
+      pending_space = ""
+      pending_tag_id = ""
+      pending_epoch = ""
+      pending_lat = ""
+      pending_lon = ""
+
+      n_det = split($0, det_parts, "DETECTION => ")
+      if (n_det >= 2) {
+        n_fields = split(det_parts[2], fields, ", ")
+        if (n_fields >= 5) {
+          pending_detect_time = fields[1]
+          pending_tag_full_id = fields[2]
+          pending_freq = fields[3]
+          pending_space = fields[4]
+          pending_tag_id = fields[5]
+          sub(/[ \r]+$/, "", pending_tag_id)
+        }
+      }
+      in_rt_block = 0
+      next
+    }
+
+    /\*\*\* RealtimeCollection Contents \*\*\*/ {
+      in_rt_block = 1
+      next
+    }
+
+    in_rt_block && /^tag: / {
+      split($0, tag_parts, ", ")
+      tag_id_from_line = tag_parts[1]
+      sub(/^tag: /, "", tag_id_from_line)
+      if (tag_id_from_line == pending_tag_id) {
+        pending_epoch = tag_parts[2]
+        pending_lat = tag_parts[3]
+        pending_lon = tag_parts[4]
+        sub(/[ \r]+$/, "", pending_lon)
+        emit_pending()
+      }
+      next
+    }
+
+    in_rt_block && /^[0-9][0-9][0-9][0-9]\// {
+      in_rt_block = 0
+    }
+
+    END {
+      emit_pending()
+    }
+  '
+}
+
+# ---------------------------------------------------------------------------
+# Offset bookmark helpers
+# ---------------------------------------------------------------------------
+read_offset_state() {
+  saved_inode=""
+  saved_offset="0"
+  if [ -f "${offset_state}" ]; then
+    saved_inode="$(awk 'NR==1{print $1}' "${offset_state}" 2>/dev/null || true)"
+    saved_offset="$(awk 'NR==1{print $2}' "${offset_state}" 2>/dev/null || true)"
+    saved_offset="${saved_offset:-0}"
+  fi
+}
+
+write_offset_state() {
+  local inode="$1"
+  local offset="$2"
+  mkdir -p "${state_dir}"
+  printf '%s %s\n' "${inode}" "${offset}" > "${offset_state}"
+}
+
+get_file_inode() {
+  local path="$1"
+  if [ -f "${path}" ]; then
+    stat -c '%i' "${path}" 2>/dev/null || ls -i "${path}" 2>/dev/null | awk '{print $1}'
+  fi
+}
+
+get_file_size() {
+  local path="$1"
+  if [ -f "${path}" ]; then
+    stat -c '%s' "${path}" 2>/dev/null || wc -c < "${path}" 2>/dev/null | tr -d ' '
+  else
+    echo "0"
+  fi
+}
+
+extract_new_log_bytes() {
+  local log_path="$1"
+  local tmp_parse="${state_dir}/.vemco_parse_chunk"
+
+  read_offset_state
+  mkdir -p "${state_dir}"
+  : > "${tmp_parse}"
+
+  if [ ! -f "${log_path}" ]; then
+    status_warn "DET=log-missing"
+    return 1
+  fi
+
+  local current_inode current_size
+  current_inode="$(get_file_inode "${log_path}")"
+  current_size="$(get_file_size "${log_path}")"
+
+  if [ -n "${saved_inode}" ] && [ "${saved_inode}" != "${current_inode}" ]; then
+    log_msg "Vemco log rotated (inode ${saved_inode} -> ${current_inode})"
+  fi
+
+  if [ -n "${saved_inode}" ] && [ "${saved_inode}" != "${current_inode}" ] && [ -f "${vemco_rotated}" ]; then
+    local rot_inode
+    rot_inode="$(get_file_inode "${vemco_rotated}")"
+    if [ "${rot_inode}" = "${saved_inode}" ]; then
+      tail -c "+$((saved_offset + 1))" "${vemco_rotated}" 2>/dev/null >> "${tmp_parse}" || true
+    fi
+    cat "${log_path}" 2>/dev/null >> "${tmp_parse}" || true
+    pending_inode="${current_inode}"
+    pending_offset="${current_size}"
+  elif [ -n "${saved_inode}" ] && [ "${saved_inode}" = "${current_inode}" ] && [ "${current_size}" -lt "${saved_offset}" ]; then
+    log_msg "Vemco log shrank; re-parsing from start"
+    cat "${log_path}" 2>/dev/null > "${tmp_parse}" || true
+    pending_inode="${current_inode}"
+    pending_offset="${current_size}"
+  elif [ "${saved_offset}" -gt 0 ] 2>/dev/null; then
+    tail -c "+$((saved_offset + 1))" "${log_path}" 2>/dev/null > "${tmp_parse}" || true
+    pending_inode="${current_inode}"
+    pending_offset="${current_size}"
+  else
+    cat "${log_path}" 2>/dev/null > "${tmp_parse}" || true
+    pending_inode="${current_inode}"
+    pending_offset="${current_size}"
+  fi
+
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# Build vessel identity string
+# ---------------------------------------------------------------------------
+log_msg "=== runme start ==="
+mkdir -p "${state_dir}" "${det_backup_dir}" 2>/dev/null || true
+
+vtime="$(date)"
+imei="$(read_file_safe "../IMEI")"
+sim="$(read_file_safe "../SIMCARD")"
+uptime="$(sed 's/.*[ ]//' < /proc/uptime 2>/dev/null || echo unknown)"
+dskused="$(df -v 2>/dev/null | awk '{ if (match($1,"rootfs|/dev/mmcblk0p3")) print $6 "=" $5 }' | tr '\r\n' ' ')"
+id="v-time=${vtime} IMEI=${imei:-unknown} SIM=${sim:-unknown} UpTime=${uptime}"
+
+if [ -z "${imei}" ]; then status_warn "IMEI=missing"; fi
+if [ -z "${sim}" ]; then status_warn "SIM=missing"; fi
+
+vessel_sn=""
+vessel_longname=""
+vessel_imei=""
+if [ -f "${hostid}" ]; then
+  for tag in sn longname imei; do
+    val="$(grep_hostid_field "${tag}")"
+    if [ -n "${val}" ]; then
+      id="${id} V${tag}=${val}"
+      case "${tag}" in
+        sn) vessel_sn="${val}" ;;
+        longname) vessel_longname="${val}" ;;
+        imei) vessel_imei="${val}" ;;
+      esac
+    fi
+  done
+else
+  status_warn "hostid=missing"
+fi
+
+id="${id} Usage ${dskused:-unknown}"
+
+det_label="${vessel_sn:-${vessel_imei:-${imei:-unknown}}}"
+det_label="$(printf '%s' "${det_label}" | tr -c 'A-Za-z0-9._-' '_')"
+call_stamp="$(date -u '+%Y%m%dT%H%M%SZ')"
+call_year_month="$(date -u '+%Y/%m')"
+
+# ---------------------------------------------------------------------------
+# VRL offload — stage by file mtime, single rsync
+# ---------------------------------------------------------------------------
+vrl_count=0
+vrl_ok=0
+
+if [ ! -d "${vrl_source}" ]; then
+  status_warn "VRL=src-missing"
+else
+  rm -rf "${vrl_staging}" 2>/dev/null || true
+  mkdir -p "${vrl_staging}"
+
+  while IFS= read -r -d '' f; do
+    [ -f "${f}" ] || continue
+    ym="$(date -r "${f}" '+%Y/%m' 2>/dev/null || date -u '+%Y/%m')"
+    base="$(basename "${f}")"
+    dest_dir="${vrl_staging}/${ym}"
+    mkdir -p "${dest_dir}"
+    if ln "${f}" "${dest_dir}/${base}" 2>/dev/null; then
+      vrl_count=$((vrl_count + 1))
+    else
+      cp -p "${f}" "${dest_dir}/${base}" 2>/dev/null && vrl_count=$((vrl_count + 1)) || status_warn "VRL=link-fail:${base}"
+    fi
+  done < <(find "${vrl_source}" -maxdepth 1 -type f -print0 2>/dev/null)
+
+  if [ "${vrl_count}" -eq 0 ]; then
+    status_add "VRL=0files"
+  elif rsync_with_retry "${vrl_staging}/" "${remote_user}@${remote_host}:${remote_vrl_base}/"; then
+    vrl_ok=1
+    status_add "VRL=${vrl_count}ok"
+    rm -rf "${vrl_staging}" 2>/dev/null || true
+  else
+    status_warn "VRL=sync-fail"
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+# Vemco detection extract + upload
+# ---------------------------------------------------------------------------
+det_count=0
+pending_inode=""
+pending_offset="0"
+csv_header="log_time,detect_time,tag_full_id,freq,space,tag_id,epoch,lat,lon"
+csv_file="${det_backup_dir}/det_${det_label}_${call_stamp}.csv"
+csv_tmp="${state_dir}/.det_${call_stamp}.csv.tmp"
+vemco_chunk="${state_dir}/.vemco_parse_chunk"
+
+if [ -f "${vemco_log}" ]; then
+  extract_new_log_bytes "${vemco_log}" || true
+  {
+    printf '%s\n' "${csv_header}"
+    if [ -s "${vemco_chunk}" ]; then
+      parse_vemco_detections < "${vemco_chunk}"
+    fi
+  } > "${csv_tmp}"
+
+  det_count="$(awk 'NR>1 && NF>0 {c++} END{print c+0}' "${csv_tmp}")"
+  # Publish under the final CSV name; this copy is also the on-vessel backup.
+  mv "${csv_tmp}" "${csv_file}" 2>/dev/null || cp "${csv_tmp}" "${csv_file}" 2>/dev/null || true
+  rm -f "${csv_tmp}" 2>/dev/null || true
+
+  remote_det_dir="${remote_det_base}/${call_year_month}"
+  if [ ! -f "${csv_file}" ]; then
+    status_warn "DET=csv-fail"
+  elif ! ensure_remote_dir "${remote_det_dir}"; then
+    status_warn "DET=mkdir-fail"
+  elif rsync_with_retry "${csv_file}" "${remote_user}@${remote_host}:${remote_det_dir}/"; then
+    status_add "DET=${det_count}new"
+    if [ -n "${pending_inode}" ]; then
+      write_offset_state "${pending_inode}" "${pending_offset}"
+    fi
+  else
+    status_warn "DET=sync-fail"
+  fi
+else
+  status_warn "DET=log-missing"
+fi
+
+# ---------------------------------------------------------------------------
+# Final status + report
+# ---------------------------------------------------------------------------
+status_add "ERR=${error_count}"
+summary="$(status_join)"
+id="${id} ${summary}"
+log_msg "Complete: ${summary}"
+
+if command -v timelimit2 >/dev/null 2>&1; then
+  timelimit2 --timeout="${ssh_timeout}" ssh -i "${ssh_key}" "${remote_user}@${remote_host}" "./response \"${id} rugged-runme\""
+  response_rc=$?
+else
+  ssh -i "${ssh_key}" "${remote_user}@${remote_host}" "./response \"${id} rugged-runme\""
+  response_rc=$?
+fi
+log_msg "response rc=${response_rc}"
+exit "${response_rc}"
