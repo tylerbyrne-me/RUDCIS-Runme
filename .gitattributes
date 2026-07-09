@@ -1,0 +1,4 @@
+# Shell scripts deployed to Linux vessels must use LF line endings.
+runme text eol=lf
+Original/runme text eol=lf
+*.sh text eol=lf
